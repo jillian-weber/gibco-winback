@@ -1,5 +1,3 @@
---source code for lsg_laboratory.stage_losses
-
 DROP TABLE IF EXISTS workflow;
 CREATE TEMPORARY TABLE workflow AS
 SELECT sku_number,
@@ -160,8 +158,6 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                        min(ship_date)                                AS first_sales,
                        max(ship_date)                                AS last_sales,
                        (max(ship_date) - min(ship_date))::FLOAT      AS days_between,
-                       /*global_region_code,
-                       global_region_name,*/
                        sum(CASE
                                WHEN ship_date BETWEEN (current_date - INTERVAL '15 months') AND current_date
                                    THEN lsg_net_sales
@@ -217,6 +213,8 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                            -- when min ship date year > 2019 then 'NEW'
                            WHEN min(ship_date) > '2019-12-31'::DATE
                                 THEN 'NEW'
+                           WHEN rev_12m > rev_precovid
+                                THEN 'INCREASING'
                            ELSE 'NULL'
                        END   AS customer_classification
                 FROM lsg_sales.tf_transactions_mapped
@@ -227,10 +225,8 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                 GROUP BY location_uid,
                          packsize_uid,
                          master_sku.sku_number
-                         /*global_region_code,
-                         global_region_name*/
-                HAVING (rev_15m / 5) > rev_3m
-                   AND (rev_3m - (rev_15m / 5)) < -1000
+                HAVING (((rev_precovid / 4.0) > rev_3m) OR  ((rev_15m / 5.0) > rev_3m))
+                   AND (((rev_3m - (rev_precovid / 4.0)) < -1000) OR ((rev_3m - (rev_15m / 5.0)) < -1000))
                 ORDER BY location_uid,
                          packsize_uid DESC),
 
@@ -273,7 +269,7 @@ SELECT DISTINCT losses.location_uid,
                 rev_precovid,
                 rev_12m,
                 (rev_precovid / 4)                                                                                  AS avg_quart_precovid,
-                abs(rev_3m - (rev_15m / 5.0))                                                                       AS opp_rev,
+                abs(rev_3m - (rev_15m / 5.0))                                                                   AS opp_rev,
                 abs(rev_3m - (rev_precovid / 4.0))                                                                  AS opp_rev_precovid,
                 labs.rev_rank                                                                                       AS revenue,
                 labs.growth_rank                                                                                    AS inertia,
@@ -393,12 +389,43 @@ order by num_buy desc;
 -- 12/5 A1435102 300 times is max
 
 
+select sum(opp_rev_precovid)
+from gibco;
+
 select sum(opportunity)
-from gibco
+from gibco;
 where customer_classification = 'DECLINING';
 
 select sum(opportunity) from gibco;
 -- before region: 48518501
+
 select count(*) from gibco;
 --before region: 9495
 -- after region: 9536
+
+-- 9177
+-- 3802
+-- 3802
+
+--60830
+--11185
+
+select count(location_uid) from gibco where customer_classification= 'DECLINING';
+--997
+-- 2495
+
+-- 22816
+select count(location_uid) from gibco where customer_classification= 'INCREASING';
+--2092
+-- 618
+
+--21497
+select count(location_uid) from gibco where customer_classification= 'LOST';
+--1122
+--665
+
+--11446
+
+select count(location_uid) from gibco where customer_classification= 'NEW';
+-- 5023
+select count(distinct location_uid) from lsg_laboratory.combined_location;
