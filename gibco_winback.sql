@@ -41,6 +41,8 @@ create temp table stage_losses
     rev_precovid      numeric(23, 2),
     rev_12m           numeric(23, 2),
     avg_quart_precovid numeric(23, 2),
+    avg_quart_15m     numeric(23,2),
+    avg_quart_12m     numeric(23,2),
     opportunity       numeric(23, 2),
     opp_rev_precovid  numeric(23, 2),
     revenue           integer,
@@ -50,8 +52,10 @@ create temp table stage_losses
     repeat            integer,
     score             numeric(23, 2),
     price_realization numeric(23, 2),
-    -- customer_classification is for "lost", "declining", or "new" classification
+    -- customer_classification is for "lost", "declining", "increasing"
     customer_classification varchar(50),
+    -- is_new is t/f value for if a customers first purchase was after 2019 (01-01-2020 or later)
+    is_new  boolean,
     created_at        timestamptz default (current_timestamp)
 );
 
@@ -61,9 +65,9 @@ INSERT INTO stage_losses (location_uid, packsize_uid, sku_number, sku_name, sku_
                           product_line_name, product_line_group_code, product_line_group_name, global_region_code, global_region_name, portfolio, keycodes, workflow_family,
                           keycode_names,
                           last_revenue, last_quantity, last_order, recurrence, rev_15m, rev_3m, rev_1m,
-                          rev_precovid, rev_12m, avg_quart_precovid,
+                          rev_precovid, rev_12m, avg_quart_precovid, avg_quart_15m, avg_quart_12m,
                           opportunity, opp_rev_precovid, revenue, inertia, frequency, recency, repeat,
-                          score, customer_classification, price_realization)
+                          score, customer_classification, is_new, price_realization)
 
 WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                                         global_region_code,
@@ -201,22 +205,30 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                        count(DISTINCT CASE
                                           WHEN ship_date BETWEEN (current_date - INTERVAL '30 days') AND current_date
                                               THEN order_number END) AS order_1m,
+
+                      (rev_precovid / 4.0)                           AS avg_quart_precovid,
+                      (rev_15m / 5.0)                                AS avg_quart_15m,
+                      (rev_12m / 4.0)                                AS avg_quart_12m,
 -- comparing past 12 months to 2019 precovid to classify as lost or declining
 -- logic is that if the revenue is 0 in the past 12months then they are "lost",
 -- if the revenue is greater than 0 then "declining" (here i wrote it as if precovid is greater than past year)
 -- if the minimum ship date year is greater than 2019 then the customer is "new"
                        CASE
-                           WHEN rev_12m = 0
+                           WHEN rev_12m = 0 --- rev_12m = 0 THEN "LOST"
                                 THEN 'LOST'
-                           WHEN rev_precovid > rev_12m
+                           WHEN avg_quart_precovid > rev_3m --- avg_quart_precovid > rev_3m THEN "DECLINING"
                                 THEN 'DECLINING'
-                           -- when min ship date year > 2019 then 'NEW'
-                           WHEN min(ship_date) > '2019-12-31'::DATE
-                                THEN 'NEW'
-                           WHEN rev_12m > rev_precovid
+                           WHEN avg_quart_precovid < rev_3m --- avg_quart_precovid < rev_3m THEN "INCREASING"
                                 THEN 'INCREASING'
-                           ELSE 'NULL'
-                       END   AS customer_classification
+                           ELSE 'OTHER'
+                       END   AS customer_classification,
+-- when min ship date year > 2019 then 'NEW'
+                      CASE
+                          WHEN min(ship_date) > '2019-12-31'::DATE
+                                THEN TRUE
+                          ELSE FALSE
+                      END AS is_new
+
                 FROM lsg_sales.tf_transactions_mapped
                          INNER JOIN lsg_laboratory.combined_delivery
                                     ON combined_delivery.del_uid = tf_transactions_mapped.del_uid
@@ -268,8 +280,10 @@ SELECT DISTINCT losses.location_uid,
                 rev_1m,
                 rev_precovid,
                 rev_12m,
-                (rev_precovid / 4)                                                                                  AS avg_quart_precovid,
-                abs(rev_3m - (rev_15m / 5.0))                                                                   AS opp_rev,
+                avg_quart_precovid,
+                avg_quart_15m,
+                avg_quart_12m,
+                abs(rev_3m - (rev_15m / 5.0))                                                                       AS opp_rev,
                 abs(rev_3m - (rev_precovid / 4.0))                                                                  AS opp_rev_precovid,
                 labs.rev_rank                                                                                       AS revenue,
                 labs.growth_rank                                                                                    AS inertia,
@@ -279,6 +293,7 @@ SELECT DISTINCT losses.location_uid,
                 sqrt((revenue * revenue + inertia * inertia + frequency * frequency + recency * recency +
                       repeat * repeat) /5)                                                                          AS score, --RMS, not super necessary here, but fun to play with;
                 customer_classification,
+                is_new,
                 100 * (CASE WHEN sku_asp.asp = 0 THEN 0
                            ELSE ((rev_15m / qty_15m) - sku_asp.asp) / sku_asp.asp END)                              AS price_realization
 FROM losses
@@ -340,6 +355,8 @@ SELECT distinct cl.nsgn_number,
                 rev_precovid,
                 rev_12m,
                 avg_quart_precovid,
+                avg_quart_15m,
+                avg_quart_12m,
                 opportunity,
                 opp_rev_precovid,
                 ntile(6) over (order by score desc) as rank,
@@ -350,6 +367,7 @@ SELECT distinct cl.nsgn_number,
                      else 'D' end)                  as score,
                 price_realization,
                 customer_classification,
+                is_new,
                 sl.created_at
 FROM stage_losses sl
          INNER JOIN lsg_laboratory.combined_location cl on cl.location_uid = sl.location_uid
@@ -428,4 +446,3 @@ select count(location_uid) from gibco where customer_classification= 'LOST';
 
 select count(location_uid) from gibco where customer_classification= 'NEW';
 -- 5023
-select count(distinct location_uid) from lsg_laboratory.combined_location;
