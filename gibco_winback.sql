@@ -1,5 +1,3 @@
---source code for lsg_laboratory.stage_losses
-
 DROP TABLE IF EXISTS workflow;
 CREATE TEMPORARY TABLE workflow AS
 SELECT sku_number,
@@ -15,7 +13,7 @@ FROM lsg_product.workflow_master
          INNER JOIN lsg_product.workflow_to_sku ON workflow_master.keycode = workflow_to_sku.keycode
 GROUP BY sku_number;
 
-
+DROP TABLE IF EXISTS stage_losses;
 create temp table stage_losses
 (
     location_uid      varchar(50),
@@ -25,6 +23,10 @@ create temp table stage_losses
     sku_size          varchar(200),
     product_line_code varchar(10),
     product_line_name varchar(255),
+    product_line_group_code varchar(255),
+    product_line_group_name varchar(255),
+    global_region_code       varchar(255),
+    global_region_name       varchar(255),
     portfolio         varchar(200),
     keycodes          varchar(200),
     workflow_family   varchar(200),
@@ -36,7 +38,11 @@ create temp table stage_losses
     rev_15m           numeric(23, 2),
     rev_3m            numeric(23, 2),
     rev_1m            numeric(23, 2),
+    rev_precovid      numeric(23, 2),
+    rev_12m           numeric(23, 2),
+    avg_quart_precovid numeric(23, 2),
     opportunity       numeric(23, 2),
+    opp_rev_precovid  numeric(23, 2),
     revenue           integer,
     inertia           integer,
     frequency         integer,
@@ -44,20 +50,24 @@ create temp table stage_losses
     repeat            integer,
     score             numeric(23, 2),
     price_realization numeric(23, 2),
-    created_at        timestamp default (current_timestamp)
+    -- customer_classification is for "lost", "declining", or "new" classification
+    customer_classification varchar(50),
+    created_at        timestamptz default (current_timestamp)
 );
 
 
---current lookback 15 months
---TO DO: adjust timeframe to fit ask for lookback period set at same quarter 2019, pre-covid
+
 INSERT INTO stage_losses (location_uid, packsize_uid, sku_number, sku_name, sku_size, product_line_code,
-                          product_line_name, portfolio, keycodes, workflow_family,
+                          product_line_name, product_line_group_code, product_line_group_name, global_region_code, global_region_name, portfolio, keycodes, workflow_family,
                           keycode_names,
                           last_revenue, last_quantity, last_order, recurrence, rev_15m, rev_3m, rev_1m,
-                          opportunity, revenue, inertia, frequency, recency, repeat,
-                          score, price_realization)
+                          rev_precovid, rev_12m, avg_quart_precovid,
+                          opportunity, opp_rev_precovid, revenue, inertia, frequency, recency, repeat,
+                          score, customer_classification, price_realization)
 
 WITH labs AS (WITH lab_sales AS (SELECT location_uid,
+                                        global_region_code,
+                                        global_region_name,
                                         sum(lsg_net_sales)  AS rev,
                                         sum(CASE
                                                 WHEN ship_date BETWEEN (current_date - INTERVAL '120 days') AND (current_date - INTERVAL '60 days')
@@ -70,9 +80,11 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                                  FROM lsg_sales.tf_transactions_mapped
                                           INNER JOIN lsg_laboratory.combined_delivery
                                                      ON combined_delivery.del_uid = tf_transactions_mapped.del_uid
-                                 WHERE ship_date > (current_date - INTERVAL '15 months')
-                                 GROUP BY location_uid)
+                               --  WHERE ship_date > (current_date - INTERVAL '15 months')
+                                 GROUP BY location_uid, global_region_code, global_region_name)
               SELECT location_uid,
+                     global_region_code,
+                     global_region_name,
                      ntile(5) OVER (ORDER BY rev)                 AS rev_rank,
                      ntile(5) OVER (ORDER BY (c6m_rev - p6m_rev)) AS growth_rank
               FROM lab_sales),
@@ -86,7 +98,7 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                                                      ON combined_delivery.del_uid = tf_transactions_mapped.del_uid
                                           INNER JOIN lsg_product.master_sku
                                                      ON tf_transactions_mapped.sku_number = master_sku.sku_number
-                                 WHERE ship_date > (current_date - INTERVAL '15 months')
+                               --  WHERE ship_date > (current_date - INTERVAL '15 months')
                                  GROUP BY location_uid,
                                           packsize_uid)
               SELECT location_uid,
@@ -105,7 +117,7 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                                                                          ON combined_delivery.del_uid = tf_transactions_mapped.del_uid
                                                               INNER JOIN lsg_product.master_sku
                                                                          ON tf_transactions_mapped.sku_number = master_sku.sku_number
-                                                     WHERE ship_date > (current_date - INTERVAL '15 months')
+                                                    -- WHERE ship_date > (current_date - INTERVAL '15 months')
                                                      GROUP BY location_uid,
                                                               packsize_uid,
                                                               ship_date)
@@ -138,7 +150,7 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                FROM lsg_sales.tf_transactions_mapped tx
                         INNER JOIN lsg_laboratory.combined_delivery ON combined_delivery.del_uid = tx.del_uid
                         INNER JOIN lsg_product.master_sku ON tx.sku_number = master_sku.sku_number
-               WHERE ship_date > (current_date - INTERVAL '15 months')
+              -- WHERE ship_date > (current_date - INTERVAL '15 months')
                ORDER BY location_uid,
                         packsize_uid DESC),
      losses AS (SELECT location_uid,
@@ -158,6 +170,16 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                                WHEN ship_date BETWEEN (current_date - INTERVAL '30 days') AND current_date
                                    THEN lsg_net_sales
                                ELSE 0 END)                           AS rev_1m,
+                    --- adding pre covid revenue
+                       sum(CASE
+                               WHEN ship_date BETWEEN '2019-01-01'::DATE AND '2019-12-31'::DATE
+                                    THEN lsg_net_sales
+                               ELSE 0 END)                          AS rev_precovid,
+                       sum(CASE
+                               WHEN ship_date BETWEEN (current_date - INTERVAL '12 months') AND current_date
+                                    THEN lsg_net_sales
+                               ELSE 0 END)                          AS rev_12m,
+
                        sum(CASE
                                WHEN ship_date BETWEEN (current_date - INTERVAL '15 months') AND current_date
                                    THEN lsg_ship_quantity
@@ -178,16 +200,33 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                                               THEN order_number END) AS order_3m,
                        count(DISTINCT CASE
                                           WHEN ship_date BETWEEN (current_date - INTERVAL '30 days') AND current_date
-                                              THEN order_number END) AS order_1m
+                                              THEN order_number END) AS order_1m,
+-- comparing past 12 months to 2019 precovid to classify as lost or declining
+-- logic is that if the revenue is 0 in the past 12months then they are "lost",
+-- if the revenue is greater than 0 then "declining" (here i wrote it as if precovid is greater than past year)
+-- if the minimum ship date year is greater than 2019 then the customer is "new"
+                       CASE
+                           WHEN rev_12m = 0
+                                THEN 'LOST'
+                           WHEN rev_precovid > rev_12m
+                                THEN 'DECLINING'
+                           -- when min ship date year > 2019 then 'NEW'
+                           WHEN min(ship_date) > '2019-12-31'::DATE
+                                THEN 'NEW'
+                           WHEN rev_12m > rev_precovid
+                                THEN 'INCREASING'
+                           ELSE 'NULL'
+                       END   AS customer_classification
                 FROM lsg_sales.tf_transactions_mapped
                          INNER JOIN lsg_laboratory.combined_delivery
                                     ON combined_delivery.del_uid = tf_transactions_mapped.del_uid
                          INNER JOIN lsg_product.master_sku ON tf_transactions_mapped.sku_number = master_sku.sku_number
-                WHERE ship_date > (current_date - INTERVAL '15 months')
+               -- WHERE ship_date > (current_date - INTERVAL '15 months')
                 GROUP BY location_uid,
-                         packsize_uid
-                HAVING (rev_15m / 5) > rev_3m
-                   AND (rev_3m - (rev_15m / 5)) < -1000
+                         packsize_uid,
+                         master_sku.sku_number
+                HAVING (((rev_precovid / 4.0) > rev_3m) OR  ((rev_15m / 5.0) > rev_3m))
+                   AND (((rev_3m - (rev_precovid / 4.0)) < -1000) OR ((rev_3m - (rev_15m / 5.0)) < -1000))
                 ORDER BY location_uid,
                          packsize_uid DESC),
 
@@ -212,6 +251,10 @@ SELECT DISTINCT losses.location_uid,
                 product_size,
                 product_hierarchy.product_line_code,
                 product_hierarchy.product_line_name,
+                product_hierarchy.product_line_group_code,
+                product_hierarchy.product_line_group_name,
+                global_region_code,
+                global_region_name,
                 dsr_product_sub_grouping                                                                            AS portfolio,
                 keycodes,
                 workflow_family,
@@ -223,7 +266,11 @@ SELECT DISTINCT losses.location_uid,
                 rev_15m,
                 rev_3m,
                 rev_1m,
-                abs(rev_3m - (rev_15m / 5))                                                                         AS opp_rev,
+                rev_precovid,
+                rev_12m,
+                (rev_precovid / 4)                                                                                  AS avg_quart_precovid,
+                abs(rev_3m - (rev_15m / 5.0))                                                                   AS opp_rev,
+                abs(rev_3m - (rev_precovid / 4.0))                                                                  AS opp_rev_precovid,
                 labs.rev_rank                                                                                       AS revenue,
                 labs.growth_rank                                                                                    AS inertia,
                 skus.orders_rank                                                                                    AS frequency,
@@ -231,6 +278,7 @@ SELECT DISTINCT losses.location_uid,
                 (CASE WHEN datediff_rank IS NULL THEN 0 ELSE datediff_rank END)                                     AS repeat,
                 sqrt((revenue * revenue + inertia * inertia + frequency * frequency + recency * recency +
                       repeat * repeat) /5)                                                                          AS score, --RMS, not super necessary here, but fun to play with;
+                customer_classification,
                 100 * (CASE WHEN sku_asp.asp = 0 THEN 0
                            ELSE ((rev_15m / qty_15m) - sku_asp.asp) / sku_asp.asp END)                              AS price_realization
 FROM losses
@@ -251,6 +299,7 @@ WHERE qty_15m <> 0;
 --bag option commented out; not useful for this exercise
 --revised sku input for Gibco
 --NOTE: if interested in covid flag for sku exclusion, lsg_product.product_master.covid_sku_flag can be utilized
+DROP TABLE IF EXISTS gibco;
 create temp table gibco as
 WITH /* bag as (SELECT distinct product_line_code
              FROM lsg_territory.master_sales_hierarchy
@@ -273,6 +322,10 @@ SELECT distinct cl.nsgn_number,
                 sku_size,
                 sl.product_line_code,
                 sl.product_line_name,
+                sl.product_line_group_code,
+                sl.product_line_group_name,
+                global_region_code,
+                global_region_name,
                 portfolio,
                 keycodes,
                 workflow_family,
@@ -284,7 +337,11 @@ SELECT distinct cl.nsgn_number,
                 rev_15m,
                 rev_3m,
                 rev_1m,
+                rev_precovid,
+                rev_12m,
+                avg_quart_precovid,
                 opportunity,
+                opp_rev_precovid,
                 ntile(6) over (order by score desc) as rank,
                 (case
                      when rank = 1 then 'A'
@@ -292,6 +349,7 @@ SELECT distinct cl.nsgn_number,
                      when rank = 3 then 'C'
                      else 'D' end)                  as score,
                 price_realization,
+                customer_classification,
                 sl.created_at
 FROM stage_losses sl
          INNER JOIN lsg_laboratory.combined_location cl on cl.location_uid = sl.location_uid
@@ -301,23 +359,25 @@ ORDER BY score, price_realization desc;
 
 --test view output
 select *
-from gibco
-limit 500;
+from gibco;
 ----------------------------QUICK STATS----------------------------------------
 --how many sgn's are there in this gibco winback?
 --2311 sgn's
 select count(distinct sgn_number)
 from gibco;
+-- 12/5 2261
 
 --how many location_uid are there in this gibco winback?
 --4985
 select count(distinct location_uid)
 from gibco;
+--12/5 4866
 
 --how many of the 1995 gibco skus are being purchased?
 --926 distinct skus purchased within the last 15 months
 select count(distinct sku_number)
 from gibco;
+--12/5 887
 
 --which skus purchased most?
 --261 times is max
@@ -326,3 +386,46 @@ from gibco
 group by sku_number
 order by num_buy desc;
 
+-- 12/5 A1435102 300 times is max
+
+
+select sum(opp_rev_precovid)
+from gibco;
+
+select sum(opportunity)
+from gibco;
+where customer_classification = 'DECLINING';
+
+select sum(opportunity) from gibco;
+-- before region: 48518501
+
+select count(*) from gibco;
+--before region: 9495
+-- after region: 9536
+
+-- 9177
+-- 3802
+-- 3802
+
+--60830
+--11185
+
+select count(location_uid) from gibco where customer_classification= 'DECLINING';
+--997
+-- 2495
+
+-- 22816
+select count(location_uid) from gibco where customer_classification= 'INCREASING';
+--2092
+-- 618
+
+--21497
+select count(location_uid) from gibco where customer_classification= 'LOST';
+--1122
+--665
+
+--11446
+
+select count(location_uid) from gibco where customer_classification= 'NEW';
+-- 5023
+select count(distinct location_uid) from lsg_laboratory.combined_location;
