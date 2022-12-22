@@ -46,8 +46,7 @@ create temp table stage_losses
     avg_quart_precovid numeric(23, 2),
     avg_quart_15m     numeric(23,2),
     avg_quart_12m     numeric(23,2),
-    -- both opportunity calculations use the same equation but with different baselines (15m or precovid)
-    opportunity       numeric(23, 2),
+    -- revenue opportunity based on precovid baseline (2019)
     opp_rev_precovid  numeric(23, 2),
     revenue           integer,
     inertia           integer,
@@ -60,9 +59,11 @@ create temp table stage_losses
     customer_classification varchar(50),
     -- is_new is t/f value for if a customers first purchase was after 2019 (01-01-2020 or later)
     is_new  boolean,
-    -- classification 12m has the same classifications as customer_classification column,
-    -- BUT this column is based on just a 12m lookback baseline instead of precovid,
-    -- this column compared against customer_classification are intended for and can be used for a confusion matrix to understand the output of data
+    /*
+    classification 12m has the same classifications as customer_classification column,
+        BUT this column is based on just a 12m lookback baseline instead of precovid,
+        this column compared against customer_classification are intended for and can be used for a confusion matrix to understand the output of data
+    */
     classification_12m  varchar(50),
     created_at        timestamptz default (current_timestamp)
 );
@@ -74,7 +75,7 @@ INSERT INTO stage_losses (location_uid, packsize_uid, sku_number, sku_name, sku_
                           keycode_names,
                           last_revenue, last_quantity, last_order, recurrence, rev_15m, rev_3m, rev_1m,
                           rev_precovid, rev_12m, avg_quart_precovid, avg_quart_15m, avg_quart_12m,
-                          opportunity, opp_rev_precovid, revenue, inertia, frequency, recency, repeat,
+                          opp_rev_precovid, revenue, inertia, frequency, recency, repeat,
                           score, customer_classification, is_new, classification_12m, price_realization)
 
 WITH labs AS (WITH lab_sales AS (SELECT location_uid,
@@ -213,43 +214,55 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                        count(DISTINCT CASE
                                           WHEN ship_date BETWEEN (current_date - INTERVAL '30 days') AND current_date
                                               THEN order_number END) AS order_1m,
-
                       (rev_precovid / 4.0)                           AS avg_quart_precovid,
                       (rev_15m / 5.0)                                AS avg_quart_15m,
                       (rev_12m / 4.0)                                AS avg_quart_12m,
-
                       -- if an account hasn't had any revenue in the past 12 months, then they are 'LOST', we don't care about them in this analysis.
                        CASE
                            WHEN rev_12m = 0
                                 THEN 'LOST'
-                       -- comparing against average quarterly so we are comparing against the same amounts of time.
-                       -- if the avg_quart_precovid is greater than rev_3m, then they are 'DECLINING'
-                       -- if the avg_quart_precovid is less than rev_3m, then they are 'INCREASING'
+                       /*
+                       comparing against average quarterly so we are comparing against the same amounts of time.
+                       if the avg_quart_precovid is greater than rev_3m, then they are 'DECLINING'
+                       if the avg_quart_precovid is less than rev_3m, then they are 'INCREASING'
+                       */
                            WHEN avg_quart_precovid > rev_3m
                                 THEN 'DECLINING'
                            WHEN avg_quart_precovid < rev_3m
                                 THEN 'INCREASING'
                        -- rather than grouping everything else into a 'NULL' bucket, looks cleaner to just call other instances 'OTHER'
                            ELSE 'OTHER'
-                       END   AS customer_classification,
-
-
-                    -- if a customers first purchase was on or after 01-01-2020 then "NEW"
-                    -- "new" classification was moved to its own column since it didn't make sense to have both revenue and order date classifications in the same column.
+                       END AS customer_classification,
+                       /*
+                        if a customers first purchase was on or after 01-01-2020 then "NEW"
+                        "new" classification was moved to its own column since it didn't make sense to have both revenue and order date classifications in the same column.
+                        */
                        min(ship_date) > '2019-12-31'::DATE AS is_new,
-
-
                        CASE
                             WHEN rev_12m = 0
                                  THEN 'LOST'
-                            WHEN avg_quart_12m> rev_3m
+                            WHEN avg_quart_12m > rev_3m
                                  THEN 'DECLINING'
                             WHEN avg_quart_12m < rev_3m
                                  THEN 'INCREASING'
                             ELSE 'OTHER'
-                       END AS classificiation_12m
-
-
+                       END AS classificiation_12m,
+                       /*
+                        abs() function is necessary here based on the HAVING clause that limits the scope of data we are looking at,
+                        more specifically where there is a limit for opportunity to be greater than -1000.
+                        As is, the revenue opp calculation SHOULD almost always produce negative numbers since we are subtracting an average quarterly (which we anticipate to be the larger number) from
+                        the past 3 months of revenue. To reiterate, that is why the abs() is necessary.
+                       */
+                       /*
+                        opp_rev_precovid is the revenue opportunity based on the precovid baseline (2019)
+                        BUT opp_rev_precovid is only calculated when an account is labeled as "DECLINING"
+                        i.e. - we only care about accounts that are 'DECLINING', why would we want any other revenue opp for this specific analysis? we don't.
+                        */
+                       CASE
+                           WHEN customer_classification = 'DECLINING'
+                                THEN abs(rev_3m - (rev_precovid / 4.0))
+                           ELSE 0
+                       END AS opp_rev_precovid
                 FROM lsg_sales.tf_transactions_mapped
                          INNER JOIN lsg_laboratory.combined_delivery
                                     ON combined_delivery.del_uid = tf_transactions_mapped.del_uid
@@ -258,15 +271,20 @@ WITH labs AS (WITH lab_sales AS (SELECT location_uid,
                 GROUP BY location_uid,
                          packsize_uid,
                          master_sku.sku_number
-                -- the having clause ensures we're only looking at the relevant data (15 month look back & precovid) for this analysis.
-                -- we compare to rev_3m months so our conditions are the same length of time - ie avg quarterly (3m average) and rev_3m (3 month revenue from the run date)
+                /*
+                the having clause ensures we're only looking at the relevant data (15 month look back & precovid) for this analysis.
+                we compare to rev_3m months so our conditions are the same length of time - ie avg quarterly (3m average) and rev_3m (3 month revenue from the run date)
+                */
                 HAVING (((rev_precovid / 4.0) > rev_3m) OR  ((rev_15m / 5.0) > rev_3m))
-                -- the AND statement limits our opportunity to be greater than 1000, because of the -1000, we need to use the abs() function when
-                -- calculating revenue opportunity so we can get accurate numbers. If we didn't use the abs() function below then all revenue opp's on both account and sum level would be negative.
-                -- As is, the revenue opp calculation SHOULD almost always produce negative numbers since we are subtracting an average quarterly (which we anticipate to be the larger number) from
-                -- the past 3 months of revenue. To reiterate, that is why the abs() is necessary.
+                /*
+                 the AND statement limits our opportunity to be greater than 1000, because of the -1000, we need to use the abs() function when
+                 calculating revenue opportunity so we can get accurate numbers. If we didn't use the abs() function below then all revenue opp's on both account and sum level would be negative.
+                 As is, the revenue opp calculation SHOULD almost always produce negative numbers since we are subtracting an average quarterly (which we anticipate to be the larger number) from
+                 the past 3 months of revenue. To reiterate, that is why the abs() is necessary.
+                 */
                    AND (((rev_3m - (rev_precovid / 4.0)) < -1000) OR ((rev_3m - (rev_15m / 5.0)) < -1000))
                 -- if the above HAVING clause were to ever be removed, then it would not make sense to maintain the abs() function when calculating revenue opportunity.
+
                 ORDER BY location_uid,
                          packsize_uid DESC),
 
@@ -311,12 +329,7 @@ SELECT DISTINCT losses.location_uid,
                 avg_quart_precovid,
                 avg_quart_15m,
                 avg_quart_12m,
-                -- abs() function is necessary here based on the HAVING clause that limits the scope of data we are looking at,
-                -- more specifically where there is a limit for opportunity to be greater than -1000.
-                -- As is, the revenue opp calculation SHOULD almost always produce negative numbers since we are subtracting an average quarterly (which we anticipate to be the larger number) from
-                -- the past 3 months of revenue. To reiterate, that is why the abs() is necessary.
-                abs(rev_3m - (rev_15m / 5.0))                                                                       AS opp_rev,
-                abs(rev_3m - (rev_precovid / 4.0))                                                                  AS opp_rev_precovid,
+                opp_rev_precovid,
                 labs.rev_rank                                                                                       AS revenue,
                 labs.growth_rank                                                                                    AS inertia,
                 skus.orders_rank                                                                                    AS frequency,
@@ -390,7 +403,6 @@ SELECT distinct cl.nsgn_number,
                 avg_quart_precovid,
                 avg_quart_15m,
                 avg_quart_12m,
-                opportunity,
                 opp_rev_precovid,
                 ntile(6) over (order by score desc) as rank,
                 (case
@@ -413,24 +425,24 @@ ORDER BY score, price_realization desc;
 select *
 from gibco;
 ----------------------------QUICK STATS----------------------------------------
--- quick stats below are from 20221221
+-- quick stats below are from 2022122
 --how many sgn's are there in this gibco winback?
--- 2456
+-- 2460
 select count(distinct sgn_number)
 from gibco;
 
 --how many location_uid are there in this gibco winback?
--- 5358
+-- 5355
 select count(distinct location_uid)
 from gibco;
 
 --how many of the 1995 gibco skus are being purchased?
--- 973
+-- 977
 select count(distinct sku_number)
 from gibco;
 
 --which skus purchased most?
--- 17504044, 303 times
+-- 17504044, 301 times
 select sku_number, count(*) as num_buy
 from gibco
 group by sku_number
@@ -438,12 +450,7 @@ order by num_buy desc;
 
 
 -- what is the sum of precovid revenue opportunity?
--- 23,796,759
+-- 16,001,701
 select sum(opp_rev_precovid)
 from gibco;
-
--- what is the sum of 15m lookback revenue opportunity?
--- 49,268,520
-select sum(opportunity) from gibco;
-
 
